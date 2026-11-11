@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Cursos{% endblock %}
+{% block content %}
+{% if not current_user and registration_enabled %}
+  <p class="guest-invitation">{{ tr('guest_invitation') }} <a href="{{ url_for('register') }}">{{ tr('create_account') }} →</a></p>
+{% endif %}
+<div class="library-layout" id="library-layout" data-guest="{{ 'false' if current_user else 'true' }}" data-csrf="{{ csrf_token() }}" data-favorite-url="{{ url_for('api_favorite', course_id='__COURSE__') }}">
+  <aside class="library-aside" aria-label="{{ tr('all_courses') }}">
+    <nav class="library-sidebar" aria-label="{{ tr('all_courses') }}">
+      <button type="button" class="library-tab active" data-filter="all" aria-pressed="true"><span class="bi bi-collection" aria-hidden="true"></span>{{ tr('all_courses') }}</button>
+      <button type="button" class="library-tab" data-filter="favorites" aria-pressed="false"><span class="bi bi-star-fill" aria-hidden="true"></span>{{ tr('favorites') }} <span class="tab-count" id="favorites-count"></span></button>
+      <button type="button" class="library-tab" data-filter="started" aria-pressed="false"><span class="bi bi-play-circle" aria-hidden="true"></span>{{ tr('in_progress') }} <span class="tab-count" id="started-count"></span></button>
+    </nav>
+    {% if show_memes %}
+    <section class="meme-card" aria-label="{{ tr('meme_alt') }}">
+      <button id="meme-open" class="meme-open" type="button" aria-label="{{ tr('meme_open') }}" title="{{ tr('meme_open') }}">
+        <img id="meme-image" src="{{ url_for('random_meme') }}" alt="{{ tr('meme_alt') }}" loading="lazy" decoding="async">
+      </button>
+      <span class="meme-error" hidden>{{ tr('meme_error') }}</span>
+    </section>
+    {% endif %}
+  </aside>
+  <section class="library-main">
+    <div class="catalog-header">
+      <label class="search-form" for="course-search">
+        <span class="search-icon bi bi-search" aria-hidden="true"></span>
+        <input id="course-search" type="search" value="{{ query }}" placeholder="{{ tr('search_placeholder') }}" autocomplete="off" aria-label="{{ tr('search_placeholder') }}">
+      </label>
+      <span class="count-pill" id="visible-count"></span>
+    </div>
+    <div class="catalog-grid" id="catalog-grid">
+      {% for course in courses %}
+      <article class="course-card" data-course-id="{{ course.id }}" data-course-name="{{ course.name|lower }}">
+        <a class="course-card-link" href="{{ url_for('course_page', course_id=course.id) }}"><h2>{{ course.name }}</h2><span class="course-card-progress" aria-hidden="true"></span></a>
+        <button class="favorite-button" type="button" aria-label="{{ tr('favorite_add') }}" title="{{ tr('favorite_add') }}" aria-pressed="false"><span class="bi bi-star" aria-hidden="true"></span></button>
+      </article>
+      {% endfor %}
+    </div>
+    <div id="catalog-empty" class="empty panel" hidden><h2 id="catalog-empty-title">{{ tr('no_courses') }}</h2><p id="catalog-empty-hint" class="muted">{{ tr('search_try_again') }}</p></div>
+  </section>
+</div>
+{% if show_memes %}
+<dialog id="meme-dialog" class="meme-dialog" aria-label="{{ tr('meme_alt') }}">
+  <button id="meme-close" class="meme-dialog-close" type="button" aria-label="{{ tr('meme_close') }}" title="{{ tr('meme_close') }}"><span class="bi bi-x-lg" aria-hidden="true"></span></button>
+  <img id="meme-dialog-image" alt="{{ tr('meme_alt') }}" decoding="async">
+</dialog>
+{% endif %}
+<script id="library-state" type="application/json">{{ state|tojson }}</script>
+<script id="library-ui" type="application/json">{{ {'all':tr('all_courses'), 'favorites':tr('favorites'), 'started':tr('in_progress'), 'favorite_add':tr('favorite_add'), 'favorite_remove':tr('favorite_remove'), 'no_courses':tr('no_courses'), 'no_favorites':tr('no_favorites'), 'no_progress':tr('no_progress'), 'star_hint':tr('star_hint'), 'start_hint':tr('start_hint'), 'search_try_again':tr('search_try_again'), 'count_of':tr('count_of'), 'error_save':tr('error_save')}|tojson }}</script>
+{% endblock %}

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="{{ lang }}" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="{{ url_for('static', filename='favicon.ico', v='2') }}" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='favicon-32x32.png', v='2') }}">
+  <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='apple-touch-icon.png', v='2') }}">
+  <title>{% block title %}Cursos{% endblock %}{% if request.endpoint != 'library' %} · Cursos{% endif %}</title>
+  <script>try{document.documentElement.dataset.theme=localStorage.getItem('cursos-theme')==='dark'?'dark':'light'}catch(e){document.documentElement.dataset.theme='light'}</script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='bootstrap-icons.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+  {% block head %}{% endblock %}
+</head>
+<body class="{{ 'lesson-view' if request.endpoint == 'lesson_page' else '' }}">
+{% block site_header %}
+<header class="topbar">
+  <div class="bar-inner">
+    <a class="brand" href="{{ url_for('library') }}" aria-label="Cursos"><img class="brand-logo" src="{{ url_for('static', filename='cursos-logo.webp') }}" alt="Cursos" width="420" height="121"></a>
+    <nav class="top-actions" aria-label="{{ tr('language') }} / {{ tr('profile_menu') }}">
+      <div class="language-switcher" aria-label="{{ tr('language') }}">
+        <a href="{{ url_for('language', code='en') }}" lang="en" hreflang="en" class="language-link {{ 'active' if lang == 'en' else '' }}" {{ 'aria-current="true"'|safe if lang == 'en' else '' }}>🇬🇧 <span>English</span></a>
+        <a href="{{ url_for('language', code='pt') }}" lang="pt" hreflang="pt" class="language-link {{ 'active' if lang == 'pt' else '' }}" {{ 'aria-current="true"'|safe if lang == 'pt' else '' }}>🇧🇷 <span>Português</span></a>
+        <a href="{{ url_for('language', code='es') }}" lang="es" hreflang="es" class="language-link {{ 'active' if lang == 'es' else '' }}" {{ 'aria-current="true"'|safe if lang == 'es' else '' }}>🇪🇸 <span>Español</span></a>
+      </div>
+      <button id="theme-toggle" class="icon-button theme-button" type="button" title="{{ tr('switch_theme') }}" aria-label="{{ tr('switch_theme') }}"><span class="theme-icon bi bi-moon-stars" aria-hidden="true"></span></button>
+      <details class="account-menu">
+        <summary class="avatar-button" aria-label="{{ tr('profile_menu') }}" title="{{ tr('profile_menu') }}">
+          {% if current_user and oidc_avatar_available %}
+            <img class="profile-avatar" src="{{ url_for('account_avatar') }}" alt="" width="38" height="38">
+          {% else %}
+            <span class="bi bi-person" aria-hidden="true"></span>
+          {% endif %}
+          {% if current_user %}<span class="profile-online"></span>{% endif %}
+        </summary>
+        <div class="account-dropdown">
+          {% if current_user %}
+            <div class="dropdown-kicker">{{ tr('signed_in') }}</div>
+            <div class="dropdown-email">{{ current_user.email }}</div>
+            <div class="dropdown-info">{{ tr('profile_tip') }}</div>
+            {% if sso_enabled %}
+              {% if sso_linked %}
+                <div class="dropdown-info">{{ tr('sso_connected') }}</div>
+              {% else %}
+                <a class="dropdown-action" href="{{ url_for('oidc_start', mode='link', next=request.full_path) }}">{{ tr('sso_link') }}</a>
+              {% endif %}
+            {% endif %}
+            <form action="{{ url_for('logout') }}" method="post" class="dropdown-form">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <button class="dropdown-action" type="submit">{{ tr('sign_out') }}</button>
+            </form>
+          {% else %}
+            <div class="dropdown-kicker">{{ tr('guest_profile') }}</div>
+            <div class="dropdown-info">{{ tr('guest_tip') }}</div>
+            {% if sso_enabled %}<a class="dropdown-action featured" href="{{ url_for('oidc_start', mode='login', next=request.full_path) }}">{{ tr('sso_sign_in') }}</a>{% endif %}
+            <a class="dropdown-action {{ 'featured' if not sso_enabled else '' }}" href="{{ url_for('login') }}">{{ tr('sign_in') }}</a>
+            {% if registration_enabled %}<a class="dropdown-action" href="{{ url_for('register') }}">{{ tr('create_account') }}</a>{% endif %}
+          {% endif %}
+        </div>
+      </details>
+    </nav>
+  </div>
+</header>
+{% endblock %}
+<main class="page {% block page_class %}{% endblock %}">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}<div class="alert {{ category }}" role="alert">{{ message }}</div>{% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

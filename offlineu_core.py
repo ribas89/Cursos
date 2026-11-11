@@ -1,912 +1,726 @@
 #!/usr/bin/env python3
-"""
-OfflineU - Self-hosted Course Viewer & Tracker
-Enhanced version with dynamic subdirectory navigation
-"""
-
+"""Cursos: multi-course, multi-user adaptation of OfflineU (MIT)."""
 import os
-import json
-import mimetypes
 import re
-import sys
-import argparse
+import secrets
+import sqlite3
+import threading
+import time
+from io import BytesIO
+from functools import wraps
+from collections.abc import Mapping
 from pathlib import Path
-from datetime import datetime
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional, Any, Tuple
-from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for
+from urllib.parse import urlsplit
+
+from oidc_internal import validate_oidc_host, oidc_backend_request
+
+from flask import (Flask, abort, flash, g, jsonify, redirect, render_template,
+                   request, send_file, session, url_for)
+from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.exceptions import HTTPException
+
+from catalog import (get_course_path, get_lesson_path, list_courses,
+                     scan_course, flatten, subtitle_for, file_kind)
+from store import (init_db, user_by_id, verify_user, create_user,
+                   update_oidc_avatar, oidc_avatar_for_user, has_oidc_avatar,
+                   progress_map, save_progress, library_state, touch_course, set_favorite,
+                   oidc_identity_for_user, link_oidc_identity, login_or_create_oidc_user)
+from i18n import TRANSLATIONS, language_for, translate
+from pdf_mobile import page_dimensions, render_page, cache_version
+from office_preview import convert_to_pdf, OFFICE_EXTENSIONS
+from markdown_preview import (convert_markdown, markdown_version, MARKDOWN_EXTENSIONS)
+from archive_preview import archive_preview, SUPPORTED_ARCHIVES
+from memes_service import IMAGE_MIMETYPES, meme_files, random_meme_file
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-change-in-production'
+secret = os.environ.get('SECRET_KEY', '')
+if not secret or len(secret) < 32 or secret.startswith('REPLACE_'):
+    raise RuntimeError('Set a random SECRET_KEY of at least 32 characters in .env')
+app.secret_key = secret
+app.config.update(SESSION_COOKIE_HTTPONLY=True,
+                  SESSION_COOKIE_SAMESITE='Lax',
+                  SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE', 'true').lower() == 'true',
+                  MAX_CONTENT_LENGTH=16 * 1024)
+# A single trusted edge proxy (Traefik); do not expose this container directly.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-# Supported file types
-VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v', '.flv', '.wmv'}
-AUDIO_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac'}
-SUBTITLE_EXTENSIONS = {'.srt', '.vtt', '.ass', '.sub', '.sbv'}
-TEXT_EXTENSIONS = {'.txt', '.md', '.html', '.htm', '.pdf', '.docx', '.doc', '.rtf'}
-QUIZ_INDICATORS = {'quiz', 'exam', 'test', 'assessment', 'exercise', 'assignment', 'homework'}
+# Authentik OIDC is optional; existing SQL email/password logins keep working.
+_OIDC_KEYS = ('OIDC_DISCOVERY_URL', 'OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_REDIRECT_URI')
+OIDC_ENABLED = all(os.environ.get(key) for key in _OIDC_KEYS)
+if not OIDC_ENABLED and any(os.environ.get(key) for key in _OIDC_KEYS):
+    raise RuntimeError('To enable SSO, configure all four OIDC_* settings in .env')
+OIDC_REQUIRED_GROUP = os.environ.get('OIDC_REQUIRED_GROUP', '').strip()
+OIDC_HOST = os.environ.get('OIDC_HOST', '').strip()
+if OIDC_HOST:
+    OIDC_HOST = validate_oidc_host(OIDC_HOST)
+    if not OIDC_ENABLED:
+        raise RuntimeError('OIDC_HOST requires the four primary OIDC_* settings')
+    if urlsplit(os.environ['OIDC_DISCOVERY_URL']).scheme not in ('http', 'https'):
+        raise RuntimeError('OIDC_DISCOVERY_URL must use http or https')
+_oidc = None
+if OIDC_ENABLED:
+    from authlib.integrations.flask_client import OAuth
+    from authlib.integrations.requests_client import OAuth2Session
+    from authlib.integrations.base_client.errors import OAuthError
+    _oauth = OAuth(app)
+
+    if OIDC_HOST:
+        class _InternalOIDCSession(OAuth2Session):
+            """Use internal Docker HTTP while keeping OIDC's public identity."""
+
+            def request(self, method, url, **kwargs):
+                network_url, forwarded = oidc_backend_request(
+                    url, os.environ['OIDC_DISCOVERY_URL'], OIDC_HOST
+                )
+                if forwarded:
+                    headers = dict(kwargs.get('headers') or {})
+                    headers.update(forwarded)
+                    kwargs['headers'] = headers
+                    # Never forward the authorization code or bearer token to
+                    # a different address if a backend endpoint redirects.
+                    kwargs['allow_redirects'] = False
+                return super().request(method, network_url, **kwargs)
+    _oidc = _oauth.register(
+        name='authentik',
+        client_id=os.environ['OIDC_CLIENT_ID'],
+        client_secret=os.environ['OIDC_CLIENT_SECRET'],
+        server_metadata_url=os.environ['OIDC_DISCOVERY_URL'],
+        # Generic User Avatar mapping is attached to the existing profile scope.
+        client_kwargs={'scope': 'openid email profile', 'code_challenge_method': 'S256'},
+    )
+    if OIDC_HOST:
+        _oidc.client_cls = _InternalOIDCSession
+
+init_db()
+_limiter = {}
+_limiter_lock = threading.Lock()
 
 
-@dataclass
-class Lesson:
-    title: str
-    path: str
-    lesson_type: str  # 'video', 'audio', 'text', 'quiz', 'mixed'
-    video_file: Optional[str] = None
-    audio_file: Optional[str] = None
-    subtitle_file: Optional[str] = None
-    text_files: List[str] = None
-    completed: bool = False
-    last_accessed: Optional[str] = None
-    progress_seconds: int = 0
-    order: int = 0
-
-    def __post_init__(self):
-        if self.text_files is None:
-            self.text_files = []
+def limited(key, limit=12, window=900):
+    """Simple process-local throttling for small private deployments."""
+    now = time.monotonic()
+    with _limiter_lock:
+        timestamps = [t for t in _limiter.get(key, []) if t > now - window]
+        if len(_limiter) > 5000:
+            for old_key, ts in list(_limiter.items()):
+                if not ts or ts[-1] < now - window:
+                    _limiter.pop(old_key, None)
+        if len(timestamps) >= limit:
+            _limiter[key] = timestamps
+            return True
+        timestamps.append(now)
+        _limiter[key] = timestamps
+    return False
 
 
-@dataclass
-class DirectoryNode:
-    """Represents a directory in the course structure"""
-    name: str
-    path: str
-    type: str  # 'directory' or 'lesson'
-    children: Dict[str, 'DirectoryNode'] = None
-    lessons: List[Lesson] = None
-    completed: bool = False
-    last_accessed: Optional[str] = None
-    order: int = 0
-    has_content: bool = False  # Whether this directory contains actual lesson content
-
-    def __post_init__(self):
-        if self.children is None:
-            self.children = {}
-        if self.lessons is None:
-            self.lessons = []
+@app.before_request
+def load_user():
+    g.user = user_by_id(session['uid']) if isinstance(session.get('uid'), int) else None
+    if g.user is None and 'uid' in session:
+        session.clear()
+    if 'csrf' not in session:
+        session['csrf'] = secrets.token_urlsafe(32)
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+        token = request.headers.get('X-CSRF-Token') or request.form.get('csrf_token')
+        if not token or not secrets.compare_digest(token, session['csrf']):
+            abort(400, description='Invalid CSRF token')
 
 
-@dataclass
-class Course:
-    name: str
-    path: str
-    root_node: DirectoryNode
-    progress_file: str
-    last_accessed_path: Optional[str] = None
-    completion_percentage: float = 0.0
+@app.context_processor
+def template_context():
+    return {'csrf_token': lambda: session.get('csrf', ''), 'current_user': g.get('user'),
+            'registration_enabled': os.environ.get('ALLOW_REGISTRATION', 'true').lower() == 'true',
+            'sso_enabled': OIDC_ENABLED,
+            'sso_linked': bool(g.get('user') and oidc_identity_for_user(g.user['id'])),
+            'sso_login': session.get('auth_method') == 'oidc',
+            'oidc_avatar_available': bool(g.get('user') and has_oidc_avatar(g.user['id'])),
+            'lang': language_for(request.cookies.get('cursos-language')),
+            'tr': lambda key: translate(language_for(request.cookies.get('cursos-language')), key),
+            'ui_text': TRANSLATIONS[language_for(request.cookies.get('cursos-language'))]}
 
-    def __post_init__(self):
-        if self.root_node is None:
-            self.root_node = DirectoryNode("", "", "directory")
 
-
-class DynamicCourseParser:
-    """Enhanced parser that builds a proper directory tree structure"""
-
-    @staticmethod
-    def scan_directory(course_path: str) -> Course:
-        """Scan directory and build dynamic tree structure"""
-        course_path = Path(course_path)
-        if not course_path.exists() or not course_path.is_dir():
-            raise ValueError(f"Invalid course path: {course_path}")
-
-        course_name = course_path.name
-        print(f"Scanning course: {course_name}")
-
-        # Build the directory tree
-        root_node = DynamicCourseParser._build_directory_tree(course_path, course_path)
-        
-        # Calculate completion statistics
-        stats = DynamicCourseParser._calculate_completion_stats(root_node)
-        
-        progress_file = str(course_path / ".offlineu_progress.json")
-
-        return Course(
-            name=course_name,
-            path=str(course_path),
-            root_node=root_node,
-            progress_file=progress_file
+@app.after_request
+def secure_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'same-origin'
+    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+    if request.path == '/account/avatar':
+        response.headers['Cache-Control'] = 'private, no-store'
+    elif request.path.startswith(('/pdf-preview/', '/office-page/', '/markdown-preview/')):
+        # A versioned image URL is immutable and its generated JPEG is permanent.
+        response.headers['Cache-Control'] = (
+            'private, max-age=31536000, immutable'
+            if response.status_code in (200, 304) and request.args.get('v')
+            else ('private, no-cache' if response.status_code in (200, 304) else 'no-store')
         )
+    else:
+        response.headers['Cache-Control'] = ('private, no-store'
+              if request.path.startswith(('/login', '/register', '/api/', '/logout', '/auth/oidc/'))
+              else 'private, no-cache')
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    if request.is_secure:
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000'
+    return response
 
-    @staticmethod
-    def _build_directory_tree(course_path: Path, current_path: Path, depth: int = 0) -> DirectoryNode:
-        """Recursively build directory tree structure"""
-        if depth > 10:  # Prevent infinite recursion
-            return DirectoryNode(current_path.name, str(current_path), "directory")
 
-        node_name = current_path.name if current_path != course_path else "Course Root"
-        node = DirectoryNode(
-            name=node_name,
-            path=str(current_path),
-            type="directory",
-            order=depth
-        )
+@app.get('/account/avatar')
+def account_avatar():
+    if not g.user:
+        abort(404)
+    avatar = oidc_avatar_for_user(g.user['id'])
+    if not avatar:
+        abort(404)
+    mime, image = avatar
+    return send_file(BytesIO(image), mimetype=mime, conditional=False)
 
-        try:
-            # Get all items in current directory
-            items = sorted(current_path.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
-            
-            for item in items:
-                if item.name.startswith('.'):
-                    continue
-                
-                if item.is_dir():
-                    # Recursively process subdirectory
-                    child_node = DynamicCourseParser._build_directory_tree(course_path, item, depth + 1)
-                    if child_node.has_content or child_node.children:
-                        node.children[child_node.name] = child_node
-                        node.has_content = True
-                
-                elif item.is_file():
-                    # Process file as potential lesson content
-                    lesson = DynamicCourseParser._create_lesson_from_file(item, course_path)
-                    if lesson:
-                        # Add lesson directly to this node's lessons list
-                        node.lessons.append(lesson)
-                        node.has_content = True
 
-        except (PermissionError, OSError) as e:
-            print(f"Error accessing {current_path}: {e}")
+def login_required(f):
+    @wraps(f)
+    def wrapper(*a, **kw):
+        if not g.user:
+            if request.path.startswith(('/api/', '/media/')):
+                return jsonify({'error': 'Authentication required'}), 401
+            return redirect(url_for('login', next=request.path))
+        return f(*a, **kw)
+    return wrapper
 
-        return node
 
-    @staticmethod
-    def _create_lesson_from_file(file_path: Path, course_path: Path) -> Optional[Lesson]:
-        """Create a lesson from a single file"""
-        ext = file_path.suffix.lower()
-        filename = file_path.name.lower()
+def safe_local_target(raw):
+    """Never accept an external redirect or an ambiguous backslash URL."""
+    if not isinstance(raw, str) or not raw.startswith('/') or len(raw) > 2048:
+        return url_for('library')
+    if raw.startswith('//') or '\\' in raw or any(ord(c) < 32 for c in raw):
+        return url_for('library')
+    parts = urlsplit(raw)
+    if parts.scheme or parts.netloc:
+        return url_for('library')
+    return raw
 
-        # Skip non-content files
-        if ext in {'.log', '.tmp', '.bak', '.swp', '.DS_Store', '.Thumbs.db'}:
-            return None
 
-        # Determine lesson type and files
-        video_file = None
-        audio_file = None
-        subtitle_file = None
-        text_files = []
-        lesson_type = 'text'
+@app.before_request
+def automatic_oidc_login():
+    """One non-interactive SSO check for anonymous HTML page navigation.
 
-        # Create relative path for file serving - normalize to forward slashes
-        relative_path = str(file_path.relative_to(course_path)).replace('\\', '/')
+    Cookies belong to tik.esquema.qzz.io: Cursos cannot directly inspect them.
+    prompt=none asks the identity provider without showing a login page.
+    """
+    if not OIDC_ENABLED or g.user or request.method != 'GET':
+        return None
+    if request.endpoint not in ('library', 'course_page', 'lesson_page'):
+        return None
+    if request.headers.get('Sec-Fetch-Mode', 'navigate') != 'navigate':
+        return None
+    now = int(time.time())
+    # A previous silent attempt may have failed before reaching Authentik
+    # (for example, during a Docker DNS outage). Do not suppress attempts
+    # for five minutes after transient failures, but prevent redirect loops.
+    if session.get('oidc_auto_suppressed') or now - session.get('oidc_checked_at', 0) < 20:
+        return None
+    session['oidc_checked_at'] = now
+    requested = request.full_path.rstrip('?')
+    return redirect(url_for('oidc_start', mode='silent', next=requested))
 
-        if ext in VIDEO_EXTENSIONS:
-            video_file = relative_path
-            lesson_type = 'video'
-        elif ext in AUDIO_EXTENSIONS:
-            audio_file = relative_path
-            lesson_type = 'audio'
-        elif ext in SUBTITLE_EXTENSIONS:
-            subtitle_file = relative_path
-            return None  # Don't create lessons for subtitle files alone
-        elif ext in TEXT_EXTENSIONS:
-            text_files.append(relative_path)
-            if any(indicator in filename for indicator in QUIZ_INDICATORS):
-                lesson_type = 'quiz'
+
+@app.before_request
+def automatic_avatar_refresh():
+    """Refresh custom avatar for existing OIDC users without changing anonymous SSO.
+
+    Runs only after the original automatic_oidc_login check. On an existing
+    logged-in session, revisit Authentik at most once every five minutes.
+    """
+    if (not OIDC_ENABLED or not g.user or session.get('auth_method') != 'oidc'
+            or request.method != 'GET'):
+        return None
+    if request.endpoint not in ('library', 'course_page', 'lesson_page'):
+        return None
+    if request.headers.get('Sec-Fetch-Mode', 'navigate') != 'navigate':
+        return None
+    now = int(time.time())
+    if now - session.get('oidc_avatar_checked_at', 0) < 300:
+        return None
+    session['oidc_avatar_checked_at'] = now
+    return redirect(url_for('oidc_start', mode='refresh',
+                            next=request.full_path.rstrip('?')))
+
+
+@app.get('/auth/oidc/start')
+def oidc_start():
+    if not OIDC_ENABLED:
+        abort(404)
+    mode = request.args.get('mode', 'login')
+    if mode not in ('silent', 'login', 'link', 'refresh'):
+        abort(400)
+    if mode in ('link', 'refresh') and not g.user:
+        return redirect(url_for('login'))
+    if g.user and mode not in ('link', 'refresh'):
+        return redirect(safe_local_target(request.args.get('next', '/')))
+    target = safe_local_target(request.args.get('next', '/'))
+    session['oidc_intent'] = {
+        'mode': mode, 'next': target, 'uid': g.user['id'] if g.user else None,
+        'started': int(time.time()),
+    }
+    try:
+        parameters = {'prompt': 'none'} if mode in ('silent', 'refresh') else {}
+        return _oidc.authorize_redirect(os.environ['OIDC_REDIRECT_URI'], **parameters)
+    except Exception:
+        app.logger.exception('Unable to start Authentik SSO')
+        session.pop('oidc_intent', None)
+        if mode not in ('silent', 'refresh'):
+            flash(translate(language_for(request.cookies.get('cursos-language')), 'sso_error'), 'error')
+        return redirect(target)
+
+
+@app.get('/auth/oidc/callback')
+def oidc_callback():
+    if not OIDC_ENABLED:
+        abort(404)
+    intent = session.pop('oidc_intent', None)
+    if not isinstance(intent, dict) or int(time.time()) - intent.get('started', 0) > 600:
+        abort(400, description='SSO sign-in request expired or missing')
+    mode = intent['mode']
+    target = safe_local_target(intent.get('next', '/'))
+
+    try:
+        # Authlib verifies OAuth state, exchanges the authorization code,
+        # and validates the ID token signature, issuer, audience and nonce.
+        token = _oidc.authorize_access_token()
+        claims = token.get('userinfo')
+        if not claims or not isinstance(claims, Mapping):
+            raise ValueError('No validated OIDC identity claims')
+        # In Authentik 2026.8, scope mappings are returned by UserInfo;
+        # including them in the ID token requires an optional provider toggle.
+        # Fetch UserInfo and verify its sub against the validated ID token.
+        metadata = _oidc.load_server_metadata()
+        userinfo_url = metadata.get('userinfo_endpoint')
+        if not userinfo_url:
+            raise ValueError('OIDC discovery lacks UserInfo endpoint')
+        userinfo_response = _oidc.get(userinfo_url, token=token)
+        userinfo_response.raise_for_status()
+        profile = userinfo_response.json()
+        if not isinstance(profile, dict) or profile.get('sub') != claims.get('sub'):
+            raise ValueError('OIDC UserInfo subject mismatch')
+    except OAuthError as exc:
+        # Also log silent failures: previously a prompt=none rejection was
+        # swallowed, making successful manual login look inexplicable.
+        app.logger.warning('Authentik %s SSO declined: %s', mode, exc.error)
+        if mode not in ('silent', 'refresh'):
+            flash(translate(language_for(request.cookies.get('cursos-language')), 'sso_error'), 'error')
+        return redirect(target)
+    except Exception:
+        app.logger.exception('Authentik OIDC callback failed')
+        if mode not in ('silent', 'refresh'):
+            flash(translate(language_for(request.cookies.get('cursos-language')), 'sso_error'), 'error')
+        return redirect(target)
+
+    issuer = claims.get('iss', '')
+    subject = claims.get('sub', '')
+    email = profile.get('email', '')
+    groups = profile.get('groups', [])
+    valid_identity = (isinstance(issuer, str) and 0 < len(issuer) <= 512
+                      and isinstance(subject, str) and 0 < len(subject) <= 512
+                      and isinstance(email, str)
+                      and re.fullmatch(r'[^\s@]{1,64}@[^\s@]{1,190}', email)
+                      and len(email) <= 254)
+    if not valid_identity or (OIDC_REQUIRED_GROUP and
+                              (not isinstance(groups, list) or OIDC_REQUIRED_GROUP not in groups)):
+        app.logger.warning('Authentik %s SSO rejected: missing identity claims or group mismatch', mode)
+        if mode not in ('silent', 'refresh'):
+            flash(translate(language_for(request.cookies.get('cursos-language')), 'sso_not_allowed'), 'error')
+        return redirect(target)
+
+    try:
+        if mode == 'refresh':
+            # A background refresh must never swap the logged-in Cursos user.
+            if not g.user or g.user['id'] != intent.get('uid'):
+                return redirect(target)
+            identity = oidc_identity_for_user(g.user['id'])
+            if not identity or identity['issuer'] != issuer or identity['subject'] != subject:
+                app.logger.warning('Authentik avatar refresh identity mismatch')
+                return redirect(target)
+            if 'avatar' in profile:
+                update_oidc_avatar(g.user['id'], profile['avatar'])
+            session['oidc_avatar_checked_at'] = int(time.time())
+            return redirect(target)
+
+        if mode == 'link':
+            if not g.user or g.user['id'] != intent['uid']:
+                abort(403)
+            if not link_oidc_identity(g.user['id'], issuer, subject):
+                flash(translate(language_for(request.cookies.get('cursos-language')), 'sso_link_conflict'), 'error')
+            else:
+                if 'avatar' in profile:
+                    update_oidc_avatar(g.user['id'], profile['avatar'])
+                flash(translate(language_for(request.cookies.get('cursos-language')), 'sso_linked'), 'success')
+            return redirect(target)
+
+        user, status = login_or_create_oidc_user(issuer, subject, email)
+        if status == 'email_conflict':
+            app.logger.warning('Authentik %s SSO cannot auto-link existing SQL email', mode)
+            if mode not in ('silent', 'refresh'):
+                flash(translate(language_for(request.cookies.get('cursos-language')), 'sso_email_conflict'), 'error')
+            return redirect(url_for('login') if mode == 'login' else target)
+        # Synchronize the avatar for both new and ALREADY CREATED accounts.
+        if 'avatar' in profile:
+            update_oidc_avatar(user['id'], profile['avatar'])
+    except sqlite3.IntegrityError:
+        app.logger.warning('SSO account was concurrently changed')
+        if mode not in ('silent', 'refresh'):
+            flash(translate(language_for(request.cookies.get('cursos-language')), 'sso_error'), 'error')
+        return redirect(target)
+
+    # Do not keep OAuth tokens in the client-side Flask session cookie.
+    session.clear()
+    session['uid'] = user['id']
+    session['csrf'] = secrets.token_urlsafe(32)
+    session['auth_method'] = 'oidc'
+    session['oidc_checked_at'] = int(time.time())
+    session['oidc_avatar_checked_at'] = int(time.time())
+    app.logger.info('Authentik %s SSO completed', mode)
+    return redirect(target)
+
+
+@app.get('/language/<code>')
+def language(code):
+    if code not in TRANSLATIONS:
+        abort(404)
+    from urllib.parse import urlsplit
+    referer = request.referrer or ''
+    parts = urlsplit(referer)
+    back = (parts.path + (('?' + parts.query) if parts.query else '')) if parts.netloc == request.host and parts.path.startswith('/') else url_for('library')
+    response = redirect(back)
+    response.set_cookie('cursos-language', code, max_age=365 * 86400,
+                        samesite='Lax', httponly=True,
+                        secure=app.config['SESSION_COOKIE_SECURE'])
+    return response
+
+
+@app.route('/health')
+def health():
+    return jsonify(status='ok')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if g.user:
+        return redirect(url_for('library'))
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()[:254]
+        password = request.form.get('password', '')
+        if limited(('login', request.remote_addr, email), 10, 900):
+            flash(translate(language_for(request.cookies.get('cursos-language')), 'too_many_login'), 'error')
         else:
-            # Skip unsupported file types
-            return None
-
-        # Clean up lesson name for display
-        display_name = DynamicCourseParser._clean_lesson_name(file_path.stem)
-
-        return Lesson(
-            title=display_name,
-            path=str(file_path),  # Store the actual file path, not just parent
-            lesson_type=lesson_type,
-            video_file=video_file,
-            audio_file=audio_file,
-            subtitle_file=subtitle_file,
-            text_files=text_files,
-            order=0
-        )
-
-    @staticmethod
-    def _clean_lesson_name(name: str) -> str:
-        """Clean up lesson name for display"""
-        # Remove common patterns
-        name = re.sub(r'^\d+[\.\-_\s]*', '', name)  # Remove leading numbers
-        name = re.sub(r'[-_]+', ' ', name)  # Replace dashes/underscores with spaces
-        name = ' '.join(word.capitalize() for word in name.split() if word)
-        return name if name.strip() else "Untitled Lesson"
-
-    @staticmethod
-    def _calculate_completion_stats(node: DirectoryNode) -> Dict[str, Any]:
-        """Calculate completion statistics for a directory node"""
-        total_lessons = 0
-        completed_lessons = 0
-        
-        def count_lessons_recursive(n: DirectoryNode):
-            nonlocal total_lessons, completed_lessons
-            
-            # Count lessons in this node
-            for lesson in n.lessons:
-                total_lessons += 1
-                if lesson.completed:
-                    completed_lessons += 1
-            
-            # Recursively count in children
-            for child in n.children.values():
-                count_lessons_recursive(child)
-        
-        count_lessons_recursive(node)
-        
-        completion_percentage = (completed_lessons / total_lessons * 100) if total_lessons > 0 else 0
-        
-        return {
-            'total_lessons': total_lessons,
-            'completed_lessons': completed_lessons,
-            'completion_percentage': round(completion_percentage, 1)
-        }
+            user = verify_user(email, password)
+            if user:
+                session.clear()
+                session['uid'] = user['id']
+                session['csrf'] = secrets.token_urlsafe(32)
+                target = request.form.get('next', '')
+                return redirect(target if target.startswith('/') and not target.startswith('//') and not target.startswith('/\\') else url_for('library'))
+            flash(translate(language_for(request.cookies.get('cursos-language')), 'invalid_credentials'), 'error')
+    return render_template('auth.html', mode='login', next=request.args.get('next', ''))
 
 
-class ProgressTracker:
-    """Handles progress tracking and persistence"""
-
-    @staticmethod
-    def load_progress(course: Course) -> Dict[str, Any]:
-        """Load progress from JSON file"""
-        try:
-            with open(course.progress_file, 'r') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-
-    @staticmethod
-    def save_progress(course: Course, progress_data: Dict[str, Any]):
-        """Save progress to JSON file"""
-        try:
-            with open(course.progress_file, 'w') as f:
-                json.dump(progress_data, f, indent=2)
-        except Exception as e:
-            print(f"Error saving progress: {e}")
-
-    @staticmethod
-    def update_lesson_progress(course: Course, lesson_path: str, completed: bool = False, progress_seconds: int = 0):
-        """Update progress for specific lesson by path"""
-        progress = ProgressTracker.load_progress(course)
-        
-        progress[lesson_path] = {
-            'completed': completed,
-            'progress_seconds': progress_seconds,
-            'last_accessed': datetime.now().isoformat()
-        }
-        
-        # Update last accessed path
-        progress['last_accessed_path'] = lesson_path
-        
-        ProgressTracker.save_progress(course, progress)
-
-    @staticmethod
-    def apply_progress_to_tree(course: Course):
-        """Apply saved progress to the course tree"""
-        progress = ProgressTracker.load_progress(course)
-        
-        def apply_to_node(node: DirectoryNode):
-            # Apply progress to lessons in this node
-            for lesson in node.lessons:
-                lesson_path = os.path.relpath(lesson.path, course.path)
-                lesson_path = lesson_path.replace('\\', '/')
-                if lesson_path.startswith('/'):
-                    lesson_path = lesson_path[1:]
-                
-                # Check both the base path and path with title
-                lesson_path_with_title = f"{lesson_path}/{lesson.title.replace(' ', '_')}"
-                
-                if lesson_path in progress:
-                    lesson.completed = progress[lesson_path].get('completed', False)
-                    lesson.last_accessed = progress[lesson_path].get('last_accessed')
-                    lesson.progress_seconds = progress[lesson_path].get('progress_seconds', 0)
-                elif lesson_path_with_title in progress:
-                    lesson.completed = progress[lesson_path_with_title].get('completed', False)
-                    lesson.last_accessed = progress[lesson_path_with_title].get('last_accessed')
-                    lesson.progress_seconds = progress[lesson_path_with_title].get('progress_seconds', 0)
-            
-            # Recursively apply to children
-            for child in node.children.values():
-                apply_to_node(child)
-        
-        apply_to_node(course.root_node)
-        course.last_accessed_path = progress.get('last_accessed_path')
-
-    @staticmethod
-    def get_completion_stats(course: Course) -> Dict[str, Any]:
-        """Calculate completion statistics"""
-        return DynamicCourseParser._calculate_completion_stats(course.root_node)
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if os.environ.get('ALLOW_REGISTRATION', 'true').lower() != 'true':
+        abort(404)
+    if g.user:
+        return redirect(url_for('library'))
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '')
+        if limited(('register', request.remote_addr), 5, 3600):
+            flash(translate(language_for(request.cookies.get('cursos-language')), 'too_many_registrations'), 'error')
+        elif not re.fullmatch(r'[^\s@]{1,64}@[^\s@]{1,190}', email) or len(email) > 254:
+            flash(translate(language_for(request.cookies.get('cursos-language')), 'invalid_email'), 'error')
+        elif not 10 <= len(password) <= 128:
+            flash(translate(language_for(request.cookies.get('cursos-language')), 'invalid_password'), 'error')
+        else:
+            try:
+                uid = create_user(email, password)
+                session.clear()
+                session['uid'] = uid
+                session['csrf'] = secrets.token_urlsafe(32)
+                return redirect(url_for('library'))
+            except sqlite3.IntegrityError:
+                flash(translate(language_for(request.cookies.get('cursos-language')), 'duplicate_email'), 'error')
+    return render_template('auth.html', mode='register')
 
 
-# Global course storage
-current_course = None
+@app.post('/logout')
+@login_required
+def logout():
+    session.clear()
+    # Local logout does not destroy the Authentik session. Avoid silently
+    # logging the user straight back in on the next page visit.
+    session['oidc_auto_suppressed'] = True
+    session['csrf'] = secrets.token_urlsafe(32)
+    return redirect(url_for('library'))
 
 
 @app.route('/')
-def index():
-    """Main dashboard"""
-    global current_course
-
-    if current_course is None:
-        # Show dashboard with course selection option
-        return render_template('course_dashboard.html',
-                               course=None,
-                               stats={'total_lessons': 0, 'completed_lessons': 0, 'completion_percentage': 0})
-
-    # Apply progress data to tree
-    ProgressTracker.apply_progress_to_tree(current_course)
-    stats = ProgressTracker.get_completion_stats(current_course)
-
-    return render_template('course_dashboard.html',
-                           course=current_course,
-                           stats=stats)
+def library():
+    query = request.args.get('q', '').strip().casefold()
+    courses = list_courses()
+    if query:
+        courses = [c for c in courses if query in c['name'].casefold()]
+    return render_template('library.html', courses=courses, query=request.args.get('q', ''), total=len(list_courses()), show_memes=bool(meme_files()), state=library_state(g.user['id']) if g.user else {'favorites': [], 'started': []})
 
 
-@app.route('/browse')
-def browse_directories():
-    """Browse directories for course selection"""
-    path = request.args.get('path', '')
-    
+@app.get('/api/meme')
+def random_meme():
+    """Return one random meme image; no uploads or archive processing."""
+    selected = random_meme_file()
+    if selected is None:
+        abort(404)
     try:
-        # If no path specified, start with available drives on Windows
-        if not path:
-            import platform
-            if platform.system() == 'Windows':
-                # Get available drives on Windows
-                import string
-                drives = []
-                for letter in string.ascii_uppercase:
-                    drive = f"{letter}:\\"
-                    if os.path.exists(drive):
-                        drives.append({
-                            'name': f"Drive {letter}:",
-                            'path': drive,
-                            'media_files': 0,
-                            'is_course_candidate': False
-                        })
-                print(f"Returning {len(drives)} drives")
-                return jsonify({
-                    'current_path': 'Select a Drive',
-                    'parent_path': None,
-                    'directories': drives
-                })
-            else:
-                # On other systems, start from home directory
-                path = str(Path.home())
+        response = send_file(selected, mimetype=IMAGE_MIMETYPES[selected.suffix.lower()],
+                             conditional=False, etag=False, max_age=0)
+    except OSError:
+        abort(404)
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
-        current_path = Path(path)
-        if not current_path.exists() or not current_path.is_dir():
-            # Fallback to home directory if path doesn't exist
-            current_path = Path.home()
 
-        print(f"Browsing directory: {current_path}")
+@app.route('/course/<course_id>')
+def course_page(course_id):
+    try:
+        progress = progress_map(g.user['id'], course_id) if g.user else {}
+        course = scan_course(course_id, completed=[k for k, val in progress.items() if val['completed']])
+    except (FileNotFoundError, ValueError):
+        abort(404)
+    if g.user:
+        touch_course(g.user['id'], course_id)
+    return render_template('course.html', course=course)
 
-        # Get directories and basic info
-        directories = []
+
+@app.route('/course/<course_id>/lesson/<path:relative>')
+def lesson_page(course_id, relative):
+    try:
+        source = get_lesson_path(course_id, relative)
+        if file_kind(source) not in {'video', 'audio', 'image', 'pdf', 'office', 'html', 'text', 'markdown', 'download'}:
+            abort(404)
+        progress = progress_map(g.user['id'], course_id) if g.user else {}
+        course = scan_course(course_id, completed=[k for k, val in progress.items() if val['completed']])
+    except (FileNotFoundError, ValueError):
+        abort(404)
+    lessons = flatten(course['tree'])
+    paths = [item['path'] for item in lessons]
+    if relative not in paths:
+        abort(404)
+    i = paths.index(relative)
+    lesson = lessons[i]
+    if g.user:
+        touch_course(g.user['id'], course_id)
+    pdf_pages = None
+    pdf_version = None
+    office_error = False
+    archive_info = archive_preview(source) if source.suffix.lower() in SUPPORTED_ARCHIVES else None
+    markdown_token = markdown_version(source) if lesson['kind'] == 'markdown' else None
+    if lesson['kind'] in ('pdf', 'office'):
         try:
-            for item in sorted(current_path.iterdir()):
-                if item.is_dir() and not item.name.startswith('.'):
-                    try:
-                        # Check if this looks like a course directory
-                        media_count = len([f for f in item.rglob('*')
-                                           if f.suffix.lower() in VIDEO_EXTENSIONS | AUDIO_EXTENSIONS])
-
-                        directories.append({
-                            'name': item.name,
-                            'path': str(item),
-                            'media_files': media_count,
-                            'is_course_candidate': media_count > 0
-                        })
-                    except (PermissionError, OSError):
-                        directories.append({
-                            'name': item.name + " (Access Denied)",
-                            'path': str(item),
-                            'media_files': 0,
-                            'is_course_candidate': False
-                        })
-        except (PermissionError, OSError) as e:
-            print(f"Access denied to {current_path}: {str(e)}")
-            return jsonify({'error': f'Access denied to {current_path}: {str(e)}'}), 403
-
-        # Determine parent path
-        parent = None
-        if current_path.parent != current_path:
-            try:
-                parent = str(current_path.parent)
-            except (PermissionError, OSError):
-                pass
-
-        print(f"Found {len(directories)} directories")
-        return jsonify({
-            'current_path': str(current_path),
-            'parent_path': parent,
-            'directories': directories
-        })
-
-    except Exception as e:
-        print(f"Error in browse_directories: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+            document = source if lesson['kind'] == 'pdf' else convert_to_pdf(source)
+            pdf_pages = page_dimensions(document)
+            pdf_version = cache_version(document)
+        except (ValueError, OSError, RuntimeError) as exc:
+            app.logger.warning('No preview for document %s: %s', source, exc)
+            office_error = lesson['kind'] == 'office'
+        except Exception:
+            app.logger.exception('Unexpected document preview error')
+            office_error = lesson['kind'] == 'office'
+    return render_template('lesson.html', course=course, lesson=lesson,
+                           progress=progress.get(relative, {'completed': False, 'seconds': 0}),
+                           subtitle=subtitle_for(course_id, relative) if lesson['kind'] == 'video' else None,
+                           previous=paths[i - 1] if i else None,
+                           following=paths[i + 1] if i + 1 < len(paths) else None,
+                           location=Path(relative).parent.as_posix(),
+                           pdf_pages=pdf_pages, pdf_version=pdf_version, office_error=office_error,
+                           archive_preview=archive_info, markdown_token=markdown_token)
 
 
-@app.route('/load_course', methods=['POST'])
-def load_course():
-    """Load course from selected directory"""
-    global current_course
-
-    data = request.json
-    course_path = data.get('course_path')
-
-    if not course_path or not os.path.exists(course_path):
-        return jsonify({'error': 'Invalid course path'}), 400
-
+@app.post('/api/progress/<course_id>')
+@login_required
+def api_progress(course_id):
+    data = request.get_json(silent=True) or {}
+    relative = data.get('path', '')
+    if not isinstance(relative, str) or len(relative) > 2048:
+        return jsonify(error='Invalid path'), 400
     try:
-        current_course = DynamicCourseParser.scan_directory(course_path)
-        return jsonify({'success': True, 'course_name': current_course.name})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        path = get_lesson_path(course_id, relative)
+        seconds = data.get('seconds', None)
+        if seconds is not None and (type(seconds) not in (int, float) or not 0 <= seconds <= 864000):
+            return jsonify(error='Invalid progress'), 400
+        completed = data.get('completed', None)
+        if completed is not None and type(completed) is not bool:
+            return jsonify(error='Invalid completion'), 400
+        saved = save_progress(g.user['id'], course_id, relative, completed, seconds)
+    except (FileNotFoundError, ValueError, TypeError):
+        return jsonify(error='Lesson not found'), 404
+    return jsonify(ok=True, **saved)
 
 
-@app.route('/lesson/<path:lesson_path>')
-def view_lesson(lesson_path: str):
-    """View specific lesson by path"""
-    global current_course
-
-    if not current_course:
-        return redirect(url_for('index'))
-
-    # Find the lesson in the tree
-    lesson = find_lesson_in_tree(current_course.root_node, lesson_path)
-    
-    if not lesson:
-        return redirect(url_for('index'))
-
-    # Get all lessons for navigation
-    all_lessons = get_all_lessons(current_course.root_node)
-    current_index = -1
-    
-    # Find current lesson index
-    for i, (path, lesson_obj) in enumerate(all_lessons):
-        if lesson_obj == lesson:
-            current_index = i
-            break
-    
-    # Get next and previous lessons
-    prev_lesson = None
-    next_lesson = None
-    
-    if current_index > 0:
-        prev_lesson = all_lessons[current_index - 1][0]
-    
-    if current_index < len(all_lessons) - 1:
-        next_lesson = all_lessons[current_index + 1][0]
-
-    # Update last accessed
-    ProgressTracker.update_lesson_progress(current_course, lesson_path)
-
-    return render_template('lesson_view.html',
-                           course=current_course,
-                           lesson=lesson,
-                           lesson_path=lesson_path,
-                           prev_lesson=prev_lesson,
-                           next_lesson=next_lesson)
-
-
-def get_lesson_url(lesson: Lesson, course_path: str) -> str:
-    """Generate the URL for a lesson"""
-    # Create relative path from course root
-    lesson_file_path = os.path.relpath(lesson.path, course_path)
-    lesson_file_path = lesson_file_path.replace('\\', '/')
-    if lesson_file_path.startswith('/'):
-        lesson_file_path = lesson_file_path[1:]
-    
-    # Append lesson title for uniqueness
-    lesson_url = f"{lesson_file_path}/{lesson.title.replace(' ', '_')}"
-    return lesson_url
-
-
-def find_lesson_in_tree(node: DirectoryNode, target_path: str) -> Optional[Lesson]:
-    """Find a lesson in the tree by path"""
-    # Check lessons in current node
-    for lesson in node.lessons:
-        lesson_url = get_lesson_url(lesson, current_course.path)
-        
-        # Check multiple possible path formats
-        lesson_file_path = os.path.relpath(lesson.path, current_course.path)
-        lesson_file_path = lesson_file_path.replace('\\', '/')
-        if lesson_file_path.startswith('/'):
-            lesson_file_path = lesson_file_path[1:]
-        
-        # Also check with lesson title appended
-        lesson_path_with_title = f"{lesson_file_path}/{lesson.title.replace(' ', '_')}"
-        
-        if (lesson_url == target_path or 
-            lesson_file_path == target_path or 
-            lesson_path_with_title == target_path):
-            return lesson
-    
-    # Recursively search children
-    for child in node.children.values():
-        result = find_lesson_in_tree(child, target_path)
-        if result:
-            return result
-    
-    return None
-
-
-def get_all_lessons(node: DirectoryNode) -> List[Tuple[str, Lesson]]:
-    """Get all lessons from the tree with their paths"""
-    lessons = []
-    
-    def collect_lessons(n: DirectoryNode, current_path: str = ""):
-        # Add lessons from this node
-        for lesson in n.lessons:
-            lesson_url = get_lesson_url(lesson, current_course.path)
-            lessons.append((lesson_url, lesson))
-        
-        # Recursively collect from children
-        for child in n.children.values():
-            collect_lessons(child, current_path)
-    
-    collect_lessons(node)
-    return lessons
-
-
-@app.route('/api/progress', methods=['POST'])
-def update_progress():
-    """API endpoint to update lesson progress"""
-    global current_course
-
-    if not current_course:
-        return jsonify({'error': 'No course loaded'}), 400
-
-    data = request.json
-    lesson_path = data.get('lesson_path')
-    completed = data.get('completed', False)
-    progress_seconds = data.get('progress_seconds', 0)
-
+@app.post('/api/favorite/<course_id>')
+@login_required
+def api_favorite(course_id):
     try:
-        ProgressTracker.update_lesson_progress(
-            current_course, lesson_path, completed, progress_seconds
+        get_course_path(course_id)
+    except (ValueError, FileNotFoundError):
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    if type(data.get('favorite')) is not bool:
+        return jsonify(error='Invalid favorite value'), 400
+    return jsonify(ok=True, favorite=set_favorite(g.user['id'], course_id, data['favorite']))
+
+
+@app.get('/pdf-preview/<course_id>/<int:page_number>/<path:relative>')
+def pdf_preview_page(course_id, page_number, relative):
+    """Serve a cached image of one PDF page for iOS inline scrolling."""
+    if page_number < 1:
+        abort(404)
+    try:
+        source = get_lesson_path(course_id, relative)
+        if source.suffix.lower() != '.pdf':
+            abort(404)
+        if request.args.get('v') and request.args.get('v') != cache_version(source):
+            abort(404)
+        preview_path = render_page(source, page_number)
+    except (FileNotFoundError, ValueError, OSError):
+        abort(404)
+    except Exception:
+        app.logger.exception('Could not render PDF preview page')
+        abort(500)
+    response = send_file(preview_path, mimetype='image/jpeg', conditional=True)
+    return response
+
+
+@app.get('/office-preview/<course_id>/<path:relative>')
+def office_pdf(course_id, relative):
+    """Stream only the derived PDF, preserving original Office downloads."""
+    try:
+        source = get_lesson_path(course_id, relative)
+        if source.suffix.lower() not in OFFICE_EXTENSIONS:
+            abort(404)
+        converted = convert_to_pdf(source)
+    except (FileNotFoundError, ValueError):
+        abort(404)
+    except HTTPException:
+        raise
+    except Exception:
+        app.logger.exception('Office conversion failed')
+        abort(503)
+    return send_file(converted, mimetype='application/pdf', conditional=True,
+                     download_name=source.stem + '.pdf')
+
+
+@app.get('/office-page/<course_id>/<int:page_number>/<path:relative>')
+def office_pdf_page(course_id, page_number, relative):
+    """Persistent JPEG pages for mobile Safari's Office PDF preview."""
+    if page_number < 1:
+        abort(404)
+    try:
+        source = get_lesson_path(course_id, relative)
+        if source.suffix.lower() not in OFFICE_EXTENSIONS:
+            abort(404)
+        converted = convert_to_pdf(source)
+        if request.args.get('v') and request.args.get('v') != cache_version(converted):
+            abort(404)
+        image_path = render_page(converted, page_number)
+    except (FileNotFoundError, ValueError):
+        abort(404)
+    except HTTPException:
+        raise
+    except Exception:
+        app.logger.exception('Office preview page failed')
+        abort(503)
+    return send_file(image_path, mimetype='image/jpeg', conditional=True)
+
+
+@app.get('/markdown-preview/<course_id>/<path:relative>')
+def markdown_html(course_id, relative):
+    """Serve an isolated, cached Markdown-to-HTML preview."""
+    try:
+        source = get_lesson_path(course_id, relative)
+        if source.suffix.lower() not in MARKDOWN_EXTENSIONS:
+            abort(404)
+        version = markdown_version(source)
+        if request.args.get('v') and request.args.get('v') != version:
+            abort(404)
+        # Resolve local image and file references relative to the Markdown file.
+        # The media route itself still enforces course path and symlink checks.
+        base_url = url_for('media_file', course_id=course_id, relative=relative).rsplit('/', 1)[0] + '/'
+        preview = convert_markdown(source, base_url)
+    except ValueError:
+        # Very large Markdown remains viewable as plain text.
+        return redirect(url_for('media_file', course_id=course_id, relative=relative))
+    except FileNotFoundError:
+        abort(404)
+    except HTTPException:
+        raise
+    except OSError:
+        app.logger.exception('Could not generate Markdown preview')
+        abort(503)
+    response = send_file(preview, mimetype='text/html; charset=utf-8', conditional=True)
+    # Always use an opaque origin and block scripts, forms, plugins and fetches.
+    response.headers['Content-Security-Policy'] = (
+        "sandbox; default-src 'none'; img-src http: https: data:; "
+        "style-src 'unsafe-inline'; base-uri 'self'; object-src 'none'; "
+        "form-action 'none'; frame-ancestors 'self'"
+    )
+    return response
+
+
+@app.route('/media/<course_id>/<path:relative>')
+def media_file(course_id, relative):
+    try:
+        path = get_lesson_path(course_id, relative)
+    except (FileNotFoundError, ValueError):
+        abort(404)
+    is_download = request.args.get('download') == '1'
+    extension = path.suffix.lower()
+    kind = file_kind(path)
+    # Files without a browser preview (including ISO, executables and unknown
+    # extensions) must still download, even if the client omits ?download=1.
+    if kind in ('download', 'office'):
+        is_download = True
+
+    # Treat source and configuration files as plain text, not executable HTML
+    # or JavaScript. In particular, browsers must not sniff arbitrary uploads.
+    mime = None
+    if extension == '.vtt':
+        # Preserve WebVTT's MIME type for the HTML5 video track element.
+        mime = 'text/vtt'
+    elif kind in ('text', 'markdown'):
+        mime = 'text/plain; charset=utf-8'
+    elif extension == '.svg':
+        mime = 'image/svg+xml'
+    elif extension in ('.jfif',):
+        mime = 'image/jpeg'
+    elif extension == '.apng':
+        mime = 'image/apng'
+    elif extension == '.avif':
+        mime = 'image/avif'
+    elif extension in ('.heic', '.heif'):
+        mime = 'image/heic' if extension == '.heic' else 'image/heif'
+    elif extension == '.xhtml':
+        mime = 'application/xhtml+xml'
+
+    response = send_file(path, as_attachment=is_download, download_name=path.name,
+                         mimetype=mime, conditional=True, max_age=0)
+    if kind == 'html' and not is_download:
+        # Serve interactive course exercises in a sandboxed, opaque origin.
+        response.headers['Content-Security-Policy'] = (
+            "sandbox allow-scripts; default-src 'self' data: blob: "
+            "'unsafe-inline' 'unsafe-eval'; frame-ancestors 'self'"
         )
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/files/<path:filepath>')
-def serve_file(filepath):
-    """Serve course files"""
-    global current_course
-
-    if not current_course:
-        return "No course loaded", 404
-
-    # Security: ensure file is within course directory
-    try:
-        # URL decode the filepath and normalize it
-        from urllib.parse import unquote
-        decoded_filepath = unquote(filepath)
-        
-        # Construct the full path relative to the course directory
-        full_path = os.path.join(current_course.path, decoded_filepath)
-        full_path = os.path.abspath(full_path)
-        course_path = os.path.abspath(current_course.path)
-
-        print(f"File request: {filepath}")
-        print(f"Decoded filepath: {decoded_filepath}")
-        print(f"Full path: {full_path}")
-        print(f"Course path: {course_path}")
-
-        # Security check: ensure file is within course directory
-        if not full_path.startswith(course_path):
-            print(f"Access denied: {full_path} not in {course_path}")
-            return "Access denied", 403
-
-        if not os.path.exists(full_path):
-            print(f"File not found: {full_path}")
-            return "File not found", 404
-
-        print(f"Serving file: {full_path}")
-
-        # Determine MIME type
-        mime_type, _ = mimetypes.guess_type(full_path)
-        if mime_type is None:
-            mime_type = 'application/octet-stream'
-
-        return send_file(full_path, mimetype=mime_type)
-    except Exception as e:
-        print(f"Error serving file: {str(e)}")
-        return f"Error serving file: {str(e)}", 500
-
-@app.route('/health')
-def healthcheck():
-    """Healthcheck endpoint for Docker"""
-    return jsonify({"status": "healthy"}), 200
-
-@app.route('/reset_course')
-def reset_course():
-    """Reset current course selection"""
-    global current_course
-    current_course = None
-    return redirect(url_for('index'))
-
-
-def create_templates():
-    """Create basic template files if they don't exist"""
-    templates_dir = Path('templates')
-    templates_dir.mkdir(exist_ok=True)
-
-    # Basic select course template
-    select_template = '''<!DOCTYPE html>
-<html>
-<head>
-    <title>OfflineU - Select Course</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; }
-        .container { max-width: 800px; margin: 0 auto; }
-        .directory { padding: 10px; border: 1px solid #ddd; margin: 5px 0; cursor: pointer; }
-        .directory:hover { background-color: #f0f0f0; }
-        .course-candidate { background-color: #e8f5e8; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>OfflineU - Course Selection</h1>
-        <div id="browser"></div>
-        <script>
-            // Basic directory browser implementation
-            function loadDirectories(path = '') {
-                fetch(`/browse?path=${encodeURIComponent(path)}`)
-                    .then(r => r.json())
-                    .then(data => {
-                        const browser = document.getElementById('browser');
-                        browser.innerHTML = `
-                            <h3>Current: ${data.current_path}</h3>
-                            ${data.parent_path ? `<div class="directory" onclick="loadDirectories('${data.parent_path}')">📁 .. (Parent)</div>` : ''}
-                            ${data.directories.map(dir => `
-                                <div class="directory ${dir.is_course_candidate ? 'course-candidate' : ''}" 
-                                     onclick="${dir.is_course_candidate ? `loadCourse('${dir.path}')` : `loadDirectories('${dir.path}')`}">
-                                    📁 ${dir.name} ${dir.media_files > 0 ? `(${dir.media_files} media files)` : ''}
-                                </div>
-                            `).join('')}
-                        `;
-                    });
-            }
-
-            function loadCourse(path) {
-                fetch('/load_course', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({course_path: path})
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        location.reload();
-                    } else {
-                        alert('Error: ' + data.error);
-                    }
-                });
-            }
-
-            loadDirectories();
-        </script>
-    </div>
-</body>
-</html>'''
-
-    # Basic course dashboard template
-    dashboard_template = '''<!DOCTYPE html>
-<html>
-<head>
-    <title>OfflineU - {{ course.name }}</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .module { margin: 20px 0; border: 1px solid #ddd; padding: 15px; }
-        .lesson { padding: 8px; margin: 5px 0; border-left: 4px solid #ddd; }
-        .lesson.completed { border-left-color: #4CAF50; background-color: #f8fff8; }
-        .lesson a { text-decoration: none; color: #333; }
-        .lesson:hover { background-color: #f0f0f0; }
-        .progress { background-color: #f0f0f0; height: 20px; border-radius: 10px; overflow: hidden; }
-        .progress-bar { background-color: #4CAF50; height: 100%; transition: width 0.3s; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>{{ course.name }}</h1>
-        <div class="progress">
-            <div class="progress-bar" style="width: {{ stats.completion_percentage }}%"></div>
-        </div>
-        <p>Progress: {{ stats.completed_lessons }}/{{ stats.total_lessons }} lessons ({{ stats.completion_percentage }}%)</p>
-
-        {% for module_idx, module in course.modules|enumerate %}
-        <div class="module">
-            <h2>{{ module.title }}</h2>
-            {% for lesson_idx, lesson in module.lessons|enumerate %}
-            <div class="lesson {% if lesson.completed %}completed{% endif %}">
-                <a href="/lesson/{{ module_idx }}/{{ lesson_idx }}">
-                    {{ lesson.title }} 
-                    <small>({{ lesson.lesson_type }})</small>
-                    {% if lesson.completed %}✓{% endif %}
-                </a>
-            </div>
-            {% endfor %}
-        </div>
-        {% endfor %}
-
-        <p><a href="/reset_course">Select Different Course</a></p>
-    </div>
-</body>
-</html>'''
-
-    # Basic lesson view template
-    lesson_template = '''<!DOCTYPE html>
-<html>
-<head>
-    <title>{{ lesson.title }} - {{ course.name }}</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        .container { max-width: 1000px; margin: 0 auto; }
-        video, audio { width: 100%; max-width: 800px; }
-        .content { margin: 20px 0; }
-        .navigation { margin: 20px 0; }
-        button { padding: 10px 20px; margin: 5px; cursor: pointer; }
-        .file-link { display: block; margin: 5px 0; padding: 5px; background: #f0f0f0; text-decoration: none; color: #333; }
-        .file-link:hover { background: #e0e0e0; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>{{ lesson.title }}</h1>
-        <div class="navigation">
-            <a href="/">← Back to Course</a>
-            <button onclick="markCompleted()">Mark as Completed</button>
-        </div>
-
-        <div class="content">
-            {% if lesson.video_file %}
-            <h3>Video</h3>
-            <video controls preload="metadata" id="video-player">
-                <source src="/files/{{ lesson.video_file }}" type="video/mp4">
-                {% if lesson.subtitle_file %}
-                <track kind="subtitles" src="/files/{{ lesson.subtitle_file }}" srclang="en" label="English">
-                {% endif %}
-                Your browser does not support the video tag.
-            </video>
-            {% endif %}
-
-            {% if lesson.audio_file %}
-            <h3>Audio</h3>
-            <audio controls preload="metadata" id="audio-player">
-                <source src="/files/{{ lesson.audio_file }}" type="audio/mp3">
-                Your browser does not support the audio tag.
-            </audio>
-            {% endif %}
-
-            {% if lesson.text_files %}
-            <h3>Additional Resources</h3>
-            {% for text_file in lesson.text_files %}
-            <a href="/files/{{ text_file }}" class="file-link" target="_blank">
-                📄 {{ text_file.split('/')[-1] }}
-            </a>
-            {% endfor %}
-            {% endif %}
-        </div>
-
-        <script>
-            function markCompleted() {
-                fetch('/api/progress', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        lesson_path: '{{ lesson_path }}',
-                        completed: true,
-                        progress_seconds: getProgressSeconds()
-                    })
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        alert('Lesson marked as completed!');
-                        window.location.href = '/';
-                    }
-                });
-            }
-
-            function getProgressSeconds() {
-                const video = document.getElementById('video-player');
-                const audio = document.getElementById('audio-player');
-                if (video && !video.paused) return Math.floor(video.currentTime);
-                if (audio && !audio.paused) return Math.floor(audio.currentTime);
-                return 0;
-            }
-
-            // Auto-save progress periodically
-            setInterval(() => {
-                const seconds = getProgressSeconds();
-                if (seconds > 0) {
-                    fetch('/api/progress', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            lesson_path: '{{ lesson_path }}',
-                            completed: false,
-                            progress_seconds: seconds
-                        })
-                    });
-                }
-            }, 30000); // Save every 30 seconds
-        </script>
-    </div>
-</body>
-</html>'''
-
-    # Write templates to files
-    template_files = {
-        'select_course.html': select_template,
-        'course_dashboard.html': dashboard_template,
-        'lesson_view.html': lesson_template
-    }
-
-    for filename, content in template_files.items():
-        template_path = templates_dir / filename
-        if not template_path.exists():
-            with open(template_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            print(f"Created template: {template_path}")
+    elif extension == '.svg' and not is_download:
+        # SVG is an image in the viewer, but direct navigation must not run
+        # scripts or read the application origin's cookies or local storage.
+        response.headers['Content-Security-Policy'] = (
+            "sandbox; default-src 'none'; style-src 'unsafe-inline'; "
+            "img-src data:; frame-ancestors 'self'"
+        )
+    return response
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='OfflineU Course Viewer & Tracker')
-    parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
-    parser.add_argument('--port', type=int, default=5000, help='Port to bind to')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
-    parser.add_argument('--create-templates', action='store_true', help='Create basic templates')
-    parser.add_argument('course_path', nargs='?', help='Path to course directory')
-
-    args = parser.parse_args()
-
-    # Create templates if requested
-    if args.create_templates:
-        create_templates()
-        print("Templates created successfully!")
-        if not args.course_path:
-            sys.exit(0)
-
-    # Auto-load course if provided
-    if args.course_path or os.environ.get('AUTO_LOAD_COURSE'):
-        course_path = args.course_path or os.environ.get('AUTO_LOAD_COURSE')
-
-        if not os.path.exists(course_path):
-            print(f"Error: Course path does not exist: {course_path}", file=sys.stderr)
-            sys.exit(1)
-
-        try:
-            current_course = DynamicCourseParser.scan_directory(course_path)
-            print(f"Auto-loaded course: {current_course.name}")
-            print(f"Built dynamic directory tree with {len(current_course.root_node.children)} top-level items")
-        except Exception as e:
-            print(f"Error loading course: {e}", file=sys.stderr)
-            if args.debug:
-                import traceback
-
-                traceback.print_exc()
-            sys.exit(1)
-
-    # Create templates directory if it doesn't exist
-    if not Path('templates').exists():
-        print("Templates directory not found. Creating basic templates...")
-        create_templates()
-
-    print(f"Starting OfflineU on http://{args.host}:{args.port}")
-    print("Use --create-templates to regenerate template files")
-
-    try:
-        app.run(debug=args.debug, host=args.host, port=args.port)
-    except KeyboardInterrupt:
-        print("\nShutting down OfflineU...")
-    except Exception as e:
-        print(f"Error starting server: {e}")
-        if args.debug:
-            import traceback
-
-            traceback.print_exc()
-        sys.exit(1)
+    app.run(host='0.0.0.0', port=5000, debug=False)

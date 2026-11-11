@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}{{ course.name }}{% endblock %}
+{% block content %}
+<a class="back-link" href="{{ url_for('library') }}"><span class="bi bi-arrow-left" aria-hidden="true"></span>{{ tr('back_to_courses') }}</a>
+<div class="course-overview panel" data-course-id="{{ course.id }}" data-guest="{{ 'false' if current_user else 'true' }}">
+  <h1>{{ course.name }}</h1>
+  <div class="stats-line"><span>{{ course.total }} {{ tr('materials') }}</span><span><strong id="course-done">{{ course.done }}</strong> {{ tr('completed') }}</span><span><strong id="course-percent">{{ ((course.done / course.total * 100) if course.total else 0)|round|int }}</strong>% {{ tr('progress') }}</span></div>
+  <div class="progress-track" id="course-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ ((course.done / course.total * 100) if course.total else 0)|round|int }}"><div class="progress-bar" id="course-progress-bar" style="width:{{ (course.done / course.total * 100) if course.total else 0 }}%"></div></div>
+</div>
+<div class="section-heading"><h2>{{ tr('modules_lessons') }}</h2></div>
+{% macro render_file(item) %}
+  <a data-lesson-path="{{ item.path }}" class="file-row {{ 'completed' if item.completed else '' }}" href="{{ url_for('lesson_page', course_id=course.id, relative=item.path) }}">
+    <span class="file-icon {{ item.kind }}"><span class="bi bi-{{ {'video':'file-earmark-play','audio':'music-note-beamed','pdf':'file-earmark-pdf','image':'file-earmark-image','html':'file-earmark-code','text':'file-earmark-text','markdown':'markdown','download':'file-earmark-arrow-down'}.get(item.kind, 'file-earmark') }}" aria-hidden="true"></span></span>
+    <span class="file-text"><span class="file-title">{{ item.name }}</span><small>{{ item.kind|upper }} · {{ item.filename }}</small></span>
+    {% if item.completed %}<span class="done-icon bi bi-check-lg" aria-label="{{ tr('lesson_complete') }}"></span>{% else %}<span class="file-chevron bi bi-chevron-right" aria-hidden="true"></span>{% endif %}
+  </a>
+{% endmacro %}
+{% macro render_folder(folder, depth=0) %}
+  <details class="folder depth-{{ depth if depth < 4 else 4 }}" {% if depth == 0 %}open{% endif %}>
+    <summary class="folder-header"><span class="folder-title"><span class="folder-icon bi bi-caret-right-fill" aria-hidden="true"></span><span>{{ folder.name }}</span></span><span class="folder-stats" data-folder-total="{{ folder.total }}">{{ folder.done }}/{{ folder.total }}</span></summary>
+    <div class="folder-body">
+      {% for file in folder.lessons %}{{ render_file(file) }}{% endfor %}
+      {% for child in folder.folders %}{{ render_folder(child, depth+1) }}{% endfor %}
+      {% if folder.truncated %}<div class="muted hint">{{ tr('max_depth') }}</div>{% endif %}
+    </div>
+  </details>
+{% endmacro %}
+<div class="modules panel">
+  {% for file in course.tree.lessons %}{{ render_file(file) }}{% endfor %}
+  {% for folder in course.tree.folders %}{{ render_folder(folder) }}{% endfor %}
+  {% if not course.total %}<p class="muted empty-course">{{ tr('no_lessons') }}</p>{% endif %}
+</div>
+{% endblock %}

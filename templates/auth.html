@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}{{ tr('register') if mode == 'register' else tr('sign_in') }}{% endblock %}
+{% block content %}
+<div class="auth-wrap"><div class="auth-card panel">
+  <h1>{{ tr('register_welcome') if mode == 'register' else tr('login_welcome') }}</h1>
+  <p class="muted">{{ tr('register_tip') if mode == 'register' else tr('login_tip') }}</p>
+  <form method="post" class="auth-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    {% if mode == 'login' %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+    <label for="email">{{ tr('email') }}</label><input required autofocus autocomplete="email" type="email" id="email" name="email" maxlength="254" placeholder="you@example.com">
+    <label for="password">{{ tr('password') }}</label><input required autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}" type="password" id="password" name="password" {% if mode == 'register' %}minlength="10" maxlength="128"{% endif %}>
+    {% if mode == 'register' %}<p class="small muted">{{ tr('password_hint') }}</p>{% endif %}
+    <button class="button primary full" type="submit">{{ tr('register') if mode == 'register' else tr('sign_in') }}</button>
+  </form>
+  {% if sso_enabled %}
+    <a class="button sso-entry" href="{{ url_for('oidc_start', mode='login', next=next if mode == 'login' else '/') }}">{{ tr('sso_sign_in') }}</a>
+  {% endif %}
+  <p class="auth-footer"><a href="{{ url_for('library') }}">← {{ tr('continue_guest') }}</a></p>
+  <p class="auth-footer">{% if mode == 'register' %}{{ tr('already_member') }} <a href="{{ url_for('login') }}">{{ tr('sign_in') }}</a>{% else %}{% if registration_enabled %}{{ tr('need_account') }} <a href="{{ url_for('register') }}">{{ tr('register') }}</a>{% else %}{{ tr('admin_only') }}{% endif %}{% endif %}</p>
+</div></div>
+{% endblock %}

@@ -1,0 +1,110 @@
+name: Publish Cursos Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag, for example v1.0.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: cursos-package-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish Cursos
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate version and check existing tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo 'Version must look like v1.0.0 or v1.0.0-rc.1'
+            exit 1
+          fi
+
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            echo "The tag $VERSION already exists"
+            exit 1
+          fi
+
+      - name: Set image name
+        id: image
+        shell: bash
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Exclude local deployment files from image
+        shell: bash
+        run: |
+          cat >> .dockerignore <<'IGNORE'
+          .git/
+          .github/
+          .env*
+          docker-compose*.yml
+          compose*.yml
+          data/
+          courses/
+          __pycache__/
+          *.pyc
+          IGNORE
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish versioned Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.title=Cursos
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+
+      - name: Create Git tag and GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$VERSION" -m "Cursos $VERSION" "$GITHUB_SHA"
+          git push origin "refs/tags/$VERSION"
+          gh release create "$VERSION" \
+            --verify-tag \
+            --title "Cursos $VERSION" \
+            --generate-notes
+
+      - name: Show published package
+        shell: bash
+        run: |
+          echo "Published ${{ steps.image.outputs.name }}:$VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "GitHub release: $VERSION" >> "$GITHUB_STEP_SUMMARY"

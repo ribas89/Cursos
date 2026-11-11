@@ -1,22 +1,43 @@
-version: '3.8'
-
+# Paste the cursos service into your EXISTING compose services section.
+# Keep your existing top-level network declaration for traefiknet.
 services:
-  offlineu:
-    image: ghcr.io/skippysteve/offlineu:main
-    container_name: offlineu-app
-    ports:
-      - "5000:5000"
-    environment:
-      - FLASK_ENV=production
-    volumes:
-      # Mount a local directory for course data persistence
-      - ./courses:/app/courses
-      # Mount a local directory for user data/progress
-      - ./data:/app/data
+  cursos:
+    image: dist.ribas.lab/local/cursos
+    cpus: 2
+    container_name: cursos
     restart: unless-stopped
+    build:
+      context: ./cursos
+      dockerfile: Dockerfile
+    env_file:
+      - ./cursos/.env
+    volumes:
+      - /media/seagate/jessica/cursos:/app/courses:ro
+      - ./cursos/data:/app/data
+      # To use your own memes, mount a host folder (read-only) here:
+      # - /absolute/host/path/to/memes:/app/custom-memes:ro
+      # Then set MEMES_DIR=/app/custom-memes in ./cursos/.env
+    networks:
+      traefiknet:
+        ipv4_address: 172.27.0.48 # Must be free in your existing subnet
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health',timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s 
+      start_period: 20s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefiknet
+      - traefik.http.routers.cursos.rule=Host(`cursos.esquema.qzz.io`)
+      - traefik.http.routers.cursos.service=cursos
+      - traefik.http.services.cursos.loadbalancer.server.url=http://172.27.0.48:5000
+      - sablier.enable=true
+      - sablier.group=cursos
+      - traefik.docker.allownonrunning=true
+      - traefik.http.middlewares.scursos.plugin.sablier.dynamic.displayname=cursos
+      - traefik.http.middlewares.scursos.plugin.sablier.group=cursos
+      - traefik.http.routers.cursos.middlewares=scursos
+networks:
+  traefiknet:
+    external: true

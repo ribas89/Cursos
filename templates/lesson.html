@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}{{ lesson.name }}{% endblock %}
+{% block page_class %}lesson-page{% endblock %}
+{% block site_header %}
+{# Single toolbar: one row desktop, two rows mobile. In normal page flow. #}
+<header class="lesson-toolbar" aria-label="{{ tr('lesson') }}">
+  <a class="lesson-toolbar-brand brand" href="{{ url_for('library') }}" aria-label="{{ tr('courses') }}"><img class="brand-logo" src="{{ url_for('static', filename='cursos-logo.webp') }}" alt="Cursos" width="420" height="121"></a>
+  <div class="lesson-toolbar-meta lesson-toolbar-course" title="{{ course.name }}"><span class="status-label">{{ tr('course') }}</span><a href="{{ url_for('course_page', course_id=course.id) }}">{{ course.name }}</a></div>
+  <div class="lesson-toolbar-meta lesson-toolbar-lesson" title="{{ lesson.name }}"><span class="status-label">{{ tr('lesson') }}</span><strong>{{ lesson.name }}</strong></div>
+  <div class="lesson-toolbar-meta lesson-toolbar-progress"><span class="status-label">{{ tr('progress') }}</span><strong id="lesson-progress-status">{{ tr('lesson_complete') if progress.completed else tr('lesson_in_progress') }}</strong></div>
+  <nav class="lesson-toolbar-actions" aria-label="{{ tr('lesson') }}">
+    <a class="button outline" href="{{ url_for('course_page', course_id=course.id) }}" data-short="{{ tr('back_short') }}" aria-label="{{ tr('back_to_course') }}"><span class="bi bi-arrow-left" aria-hidden="true"></span><span class="button-label">{{ tr('back_to_course') }}</span></a>
+    <button type="button" id="complete-button" class="button primary complete-button" data-completed="{{ 'true' if progress.completed else 'false' }}" data-short="{{ tr('undo_short') if progress.completed else tr('complete_short') }}" aria-label="{{ tr('undo_complete') if progress.completed else tr('complete') }}">{{ tr('undo_complete') if progress.completed else tr('complete') }}</button>
+    <a class="button download-button" href="{{ url_for('media_file', course_id=course.id, relative=lesson.path, download=1) }}" data-short="{{ tr('download_short') }}" aria-label="{{ tr('download') }}"><span class="bi bi-download" aria-hidden="true"></span><span class="button-label">{{ tr('download') }}</span></a>
+    {% if following %}<a class="button outline" href="{{ url_for('lesson_page', course_id=course.id, relative=following) }}" data-short="{{ tr('next_short') }}" aria-label="{{ tr('next_lesson') }}"><span class="button-label">{{ tr('next_lesson') }}</span><span class="bi bi-arrow-right" aria-hidden="true"></span></a>{% endif %}
+  </nav>
+</header>
+{% endblock %}
+{% block content %}
+{% set media_url = url_for('media_file', course_id=course.id, relative=lesson.path) %}
+<section class="lesson-media" aria-label="{{ tr('lesson') }}">
+{% if lesson.kind == 'video' %}
+  <video id="lesson-media" controls preload="metadata" playsinline class="player"><source src="{{ media_url }}">{% if subtitle %}<track src="{{ url_for('media_file', course_id=course.id, relative=subtitle) }}" kind="subtitles" srclang="pt" label="Subtitles">{% endif %}{{ tr('unsupported_video') }}</video>
+{% elif lesson.kind == 'audio' %}
+  <audio id="lesson-media" controls preload="metadata" class="player"><source src="{{ media_url }}">{{ tr('unsupported_audio') }}</audio>
+{% elif lesson.kind == 'image' %}
+  <div class="lesson-image-preview">
+    <img class="lesson-inline-image" src="{{ media_url }}" alt="{{ lesson.filename }}" decoding="async">
+    <div class="lesson-image-error download-placeholder" hidden>
+      <h2>{{ lesson.filename }}</h2><p class="muted">{{ tr('download_only') }}</p>
+    </div>
+  </div>
+{% elif lesson.kind in ('pdf', 'office') %}
+  {% set preview_url = url_for('office_pdf', course_id=course.id, relative=lesson.path) if lesson.kind == 'office' else media_url %}
+  {# Avoid loading native PDF in iOS before JavaScript chooses a viewer. #}
+  {% if not office_error %}
+  <iframe class="doc-frame native-pdf" data-pdf-src="{{ preview_url }}" title="{{ lesson.name }}"></iframe>
+  {% endif %}
+  {% if pdf_pages %}
+  <div id="ios-pdf-pages" class="ios-pdf-pages" hidden>
+    <div class="ios-pdf-message">
+      <span>{{ tr('office_mobile_scroll') if lesson.kind == 'office' else tr('pdf_mobile_scroll') }}</span>
+      <a href="{{ preview_url }}" target="_blank" rel="noopener">{{ tr('office_open_preview') if lesson.kind == 'office' else tr('pdf_open_original') }} ↗</a>
+    </div>
+    {% for width, height in pdf_pages %}
+    <figure class="ios-pdf-page">
+      <div class="ios-pdf-canvas" style="aspect-ratio: {{ width }} / {{ height }}">
+        <img data-src="{{ url_for('office_pdf_page' if lesson.kind == 'office' else 'pdf_preview_page', course_id=course.id, page_number=loop.index, relative=lesson.path, v=pdf_version) }}"
+             alt="{{ tr('pdf_page') }} {{ loop.index }} / {{ pdf_pages|length }}"
+             width="{{ width }}" height="{{ height }}" decoding="async" hidden>
+        <div class="ios-pdf-state" role="status">
+          <span>{{ tr('pdf_loading_page') }}</span>
+          <button type="button" class="button outline ios-pdf-retry" hidden>{{ tr('pdf_retry_page') }}</button>
+        </div>
+      </div>
+      <figcaption>{{ tr('pdf_page') }} {{ loop.index }} / {{ pdf_pages|length }}</figcaption>
+    </figure>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div id="ios-pdf-fallback" class="ios-pdf-fallback" hidden>
+    <a class="button primary" href="{{ preview_url }}" target="_blank" rel="noopener">{{ tr('office_open_preview') if lesson.kind == 'office' else tr('pdf_open_original') }} ↗</a>
+  </div>
+  {% endif %}
+  {% if office_error and lesson.kind == 'office' %}
+  <div class="download-placeholder"><h2>{{ lesson.filename }}</h2><p class="muted">{{ tr('download_only') }}</p><a class="button download-button" href="{{ url_for('media_file', course_id=course.id, relative=lesson.path, download=1) }}"><span class="bi bi-download" aria-hidden="true"></span>{{ tr('download') }}</a></div>
+  {% endif %}
+  <noscript><p><a href="{{ preview_url }}">{{ tr('pdf_open_original') }}</a></p></noscript>
+{% elif lesson.kind == 'html' %}
+  <iframe class="doc-frame" src="{{ media_url }}" sandbox="allow-scripts" referrerpolicy="no-referrer" title="{{ lesson.name }}"></iframe>
+  <p class="small muted">{{ tr('html_tip') }}</p>
+{% elif lesson.kind == 'markdown' %}
+  <iframe class="doc-frame markdown-frame" src="{{ url_for('markdown_html', course_id=course.id, relative=lesson.path, v=markdown_token) }}" sandbox="" referrerpolicy="no-referrer" title="{{ lesson.name }}"></iframe>
+{% elif lesson.kind == 'text' %}
+  <iframe class="doc-frame" src="{{ media_url }}" sandbox="" referrerpolicy="no-referrer" title="{{ lesson.name }}"></iframe>
+{% elif archive_preview %}
+  <div class="archive-preview">
+    <header class="archive-preview-heading">
+      <div class="archive-preview-icon" aria-hidden="true"><span class="bi bi-file-earmark-zip"></span></div>
+      <h2>{{ lesson.filename }}</h2>
+      <p class="muted">{{ tr('archive_metadata_only') }}</p>
+    </header>
+    <div class="archive-stats">
+      <div><strong>{{ archive_preview.compressed_label }}</strong><span>{{ tr('archive_compressed_size') }}</span></div>
+      <div><strong>{{ archive_preview.uncompressed_label }}</strong><span>{{ tr('archive_uncompressed_size') }}</span></div>
+      <div><strong>{{ archive_preview.files }}{% if archive_preview.truncated %}+{% endif %}</strong><span>{{ tr('archive_files') }}</span></div>
+      <div><strong>{{ archive_preview.folders }}{% if archive_preview.truncated %}+{% endif %}</strong><span>{{ tr('archive_folders') }}</span></div>
+    </div>
+    {% if archive_preview.available %}
+      {% macro show_archive_nodes(nodes, level=0) %}
+        <ul class="archive-tree-list">
+          {% for node in nodes %}
+            <li>
+              {% if node.is_dir %}
+                <details class="archive-folder" {% if level < 2 %}open{% endif %}>
+                  <summary><span class="archive-name"><span class="bi bi-caret-right-fill archive-caret" aria-hidden="true"></span><span class="bi bi-folder2" aria-hidden="true"></span>{{ node.name }}</span></summary>
+                  {{ show_archive_nodes(node.children, level + 1) }}
+                </details>
+              {% else %}
+                <div class="archive-file-row"><span class="archive-name"><span class="bi bi-file-earmark" aria-hidden="true"></span>{{ node.name }}</span><span class="archive-entry-size">{{ node.size_label }}</span></div>
+              {% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+      {% endmacro %}
+      <div class="archive-contents">
+        <h3>{{ tr('archive_contents') }}</h3>
+        {% if archive_preview.nodes %}{{ show_archive_nodes(archive_preview.nodes) }}{% else %}<p class="muted">{{ tr('archive_empty') }}</p>{% endif %}
+        {% if archive_preview.truncated %}<p class="archive-note muted">{{ tr('archive_limited') }}</p>{% endif %}
+      </div>
+    {% else %}
+      <p class="archive-note muted">{{ tr('archive_unavailable') }}</p>
+    {% endif %}
+  </div>
+{% else %}
+  <div class="download-placeholder"><h2>{{ lesson.filename }}</h2><p class="muted">{{ tr('download_only') }}</p></div>
+{% endif %}
+</section>
+<div id="lesson-controls" hidden
+ data-endpoint="{{ url_for('api_progress', course_id=course.id) }}"
+ data-course-id="{{ course.id }}" data-guest="{{ 'false' if current_user else 'true' }}"
+ data-path="{{ lesson.path }}" data-csrf="{{ csrf_token() }}"
+ data-seconds="{{ progress.seconds }}" data-completed="{{ 'true' if progress.completed else 'false' }}"
+ data-kind="{{ lesson.kind }}"
+ data-complete-label="{{ tr('lesson_complete') }}" data-progress-label="{{ tr('lesson_in_progress') }}"
+ data-mark-label="{{ tr('complete') }}" data-undo-label="{{ tr('undo_complete') }}"
+ data-mark-short="{{ tr('complete_short') }}" data-undo-short="{{ tr('undo_short') }}"></div>
+{% endblock %}

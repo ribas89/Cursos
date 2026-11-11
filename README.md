@@ -1,129 +1,96 @@
-# OfflineU: Self-Hosted Local Course Loader & Progress Tracker
+# GitHub repositories are now mirror only
 
-**OfflineU** is a sleek, self-hosted web app designed to load and view your offline video, audio, text, and quiz-based training courses. Whether it's Udemy downloads, "open sourced" training archives, or personal content, OfflineU turns your course folder into a fully navigable dashboard with automatic progress tracking.
+Due to recent changes in GitHub's direction, development has migrated to: https://git.ribas89.co.uk/
 
----
+Have a issue/question? https://link.ribas89.co.uk/ask
 
-## ✨ Features
 
-* 📁 **Dynamic folder parsing**: Scans and maps your course structure into a browsable tree view.
-* 🎥 **Video & Audio player**: Integrated media player with resume & completion tracking.
-* 📄 **Text & HTML viewer**: Supports .txt, .md, .html, .pdf, and more.
-* ✅ **Lesson progress tracking**: Auto-saves your time spent and marks lessons as completed.
-* ♻️ **Continue where you left off**: Resume instantly from your last-accessed lesson.
-* 💾 **Local-first & private**: 100% offline. No cloud, no tracking, no nonsense.
-* 🧑‍💻 **Works with any course format**: No metadata required, just structured folders.
-* 🧠 **Ideal for hoarders, students, or offline learning setups**
+Thank you for your support ❤️!
 
----
 
-## 🗈️ Screenshots
+# Cursos
 
-> ![image](https://github.com/WhiskeyCoder/OfflineU/blob/main/images/lesson-0-8-2025-08-04-04_58_17.png)
+Cursos is a fork of [OfflineU](https://github.com/WhiskeyCoder/OfflineU) with user accounts, optional Authentik SSO, improved course browsing, and additional file previews.
 
----
+## Features by OfflineU
 
-## 🛠️ Installation
+- Load courses directly from folders without importing metadata
+- Browse courses and lessons by folder structure
+- Play video and audio lessons
+- Read text, HTML, and PDF lessons
+- Save lesson progress and resume playback
+- Run locally without relying on a cloud service
 
-### 🔁 Quick Start (Local)
+## Additional features by Cursos
 
-1. Clone the repo:
+- Guest browsing with progress saved in the browser
+- Local user accounts with SQLite progress storage
+- Optional Authentik login using OpenID Connect
+- Automatic SSO checks and linking to existing local accounts
+- Custom Authentik avatar support using the `avatar` claim, including Base64 images
+- Native previews for browser-supported images and other readable file formats
+- Rendered Markdown previews with fenced code, tables, and disk caching
+- Download any non-hidden regular course file, including ISO images and files without extensions
+- Avatar refresh for linked SSO accounts
+- Favorites, recently opened courses, and completion tracking
+- Updated course library and lesson layouts
+- English, Portuguese, and Spanish interfaces
+- Light and dark themes
+- Office document previews using LibreOffice
+- ZIP, 7z, and RAR archive listings without extracting files
+- Cached, scrollable PDF previews on mobile devices
+- Optional random image card on the home page
 
-   ```bash
-   git clone https://github.com/WhiskeyCoder/OfflineU.git
-   cd OfflineU
-   ```
+## Docker Compose
 
-2. Install Python dependencies:
+Place `docker-compose.yml` next to the project's `Dockerfile`. Create a `.env` file and folders named `courses` and `data`.
 
-   ```bash
-   pip install flask
-   ```
-
-3. Run the app:
-
-   ```bash
-   python offlineu_core.py --create-templates
-   ```
-
-4. Open your browser:
-
-   ```
-   http://127.0.0.1:5000
-   ```
-
----
-
-## 📂 Folder Structure Example
-
-```bash
-MyCourse/
-├── Section 1/
-│   ├── 01 - Intro.mp4
-│   ├── 02 - Setup Guide.pdf
-│   └── 03 - Quiz.html
-├── Section 2/
-│   ├── 04 - Advanced Tips.mp4
-│   └── resources/
-│       └── extras.md
-└── .offlineu_progress.json  ← created automatically
+```yaml
+services:
+  cursos:
+    image: ghcr.io/ribas89/cursos:v2.0.0
+    container_name: cursos
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - ./courses:/app/courses:ro
+      - ./data:/app/data
 ```
 
-> 🌟 File types are detected automatically — videos, audio, quizzes, and docs.
+This example exposes Cursos only on the Docker host at `http://localhost:5000`. Configure a trusted reverse proxy if you need external HTTPS access. Keep the course mount read-only and make sure `/app/data` is writable by container user ID `1000`.
 
----
+## Environment variables
 
-## 📁 Supported File Types
+| Variable | Purpose | Default or example |
+| --- | --- | --- |
+| `SECRET_KEY` | Flask session signing key. Required | A unique random secret |
+| `COURSES_ROOT` | Location of the read-only course library inside the container | `/app/courses` |
+| `DATABASE_PATH` | SQLite database for users and progress | `/app/data/cursos.sqlite3` |
+| `COOKIE_SECURE` | Require HTTPS for session cookies. Set to `false` for local HTTP development only | `true` |
+| `ALLOW_REGISTRATION` | Show or hide local account registration | `true` |
+| `OFFICE_CONVERT_TIMEOUT` | Maximum time in seconds for an Office document conversion | `90` |
+| `MEMES_ENABLED` | Enable the optional home page image card | `true` |
+| `MEMES_DIR` | Image directory inside the container | `/app/memes` |
+| `LIBREOFFICE_BINARY` | Optional path to the LibreOffice executable | System LibreOffice |
 
-| Type      | Extensions                                                  |
-| --------- | ----------------------------------------------------------- |
-| Videos    | `.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, etc.               |
-| Audio     | `.mp3`, `.wav`, `.aac`, etc.                                |
-| Docs      | `.txt`, `.md`, `.html`, `.pdf`, `.docx`                     |
-| Subtitles | `.srt`, `.vtt`                                              |
-| Quizzes   | Detected if file name contains `quiz`, `exam`, `test`, etc. |
+### Optional Authentik SSO
 
----
+Create an OAuth2/OpenID Connect provider in Authentik and register `https://courses.example.com/auth/oidc/callback` as its redirect URI. Set all four required `OIDC_*` variables to enable SSO.
 
-## ⚙️ CLI Options
+| Variable | Purpose | Example |
+| --- | --- | --- |
+| `OIDC_DISCOVERY_URL` | OIDC discovery document URL | `https://auth.example.com/application/o/cursos/.well-known/openid-configuration` |
+| `OIDC_CLIENT_ID` | Client ID issued by Authentik | Your client ID |
+| `OIDC_CLIENT_SECRET` | Client secret issued by Authentik | Your client secret |
+| `OIDC_REDIRECT_URI` | Public callback URI registered with the provider | `https://courses.example.com/auth/oidc/callback` |
+| `OIDC_REQUIRED_GROUP` | Optional required Authentik group claim | Leave unset or enter a group name |
+| `OIDC_HOST` | Optional public Authentik hostname when discovery uses internal HTTP transport | `auth.example.com` |
 
-| Option               | Description                     |
-| -------------------- | ------------------------------- |
-| `--host`             | Set host (default: `127.0.0.1`) |
-| `--port`             | Set port (default: `5000`)      |
-| `--debug`            | Enable Flask debug mode         |
-| `--create-templates` | Generate default HTML templates |
-| `<course_path>`      | Load course directly at startup |
+Cursos requests the `openid`, `email`, and `profile` scopes. To use custom avatars, add a `profile` scope mapping that returns the user's custom `attributes.avatar` as the `avatar` claim. Steam avatar attributes are not used.
 
----
+## License
 
-## 🧠 Roadmap
-
-* [x] Base function and testing
-* [ ] Multi-user profile support
-* [ ] Dark/light theme switcher
-* [ ] Built-in quiz interactivity
-* [ ] Import/export course metadata
-* [ ] Mobile app wrapper
-* [ ] Self hosted Docker Deployment
-
----
-
-## 💬 Community
-
-Join the development, suggest features, or ask questions via:
-
-* GitHub Issues: [https://github.com/WhiskeyCoder/OfflineU/issues](https://github.com/WhiskeyCoder/OfflineU/issues)
-
----
-
-## 🛡️ License
-
-MIT License — Use freely, modify locally, share widely.
-
----
-
-## ✨ Author
-
-Built with ❤️ by [@WhiskeyCoder](https://github.com/WhiskeyCoder)
-Inspired by the dream of **learning freely, offline, and without limits.**
+MIT. Based on [OfflineU](https://github.com/WhiskeyCoder/OfflineU) by WhiskeyCoder.
